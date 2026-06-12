@@ -10,10 +10,13 @@ import dash_bootstrap_components as dbc
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.slc_processor import SLCProcessor
 from src.interferogram import Interferogram
+from src.phase_unwrap import PhaseUnwrapper
 
 
 processor = SLCProcessor(width=1024, height=1024)
 interferogram_calc = Interferogram(multi_look_window=(7, 7), coherence_threshold=0.3)
+unwrapper = PhaseUnwrapper(quality_threshold=0.3)
+current_unwrap_algorithm = 'quality'
 
 print("=" * 60)
 print(" 正在生成极地 SAR 复数影像数据...")
@@ -59,6 +62,19 @@ drift_analysis = interferogram_calc.glacier_drift_analysis(
 
 print(f" 平均漂移速率: {drift_analysis['mean_drift']:.2f} m/月")
 print(f" 最大漂移速率: {drift_analysis['max_drift']:.2f} m/月")
+
+print("\n" + "=" * 60)
+print(" 相位解缠 (初始: 质量引导法)...")
+print("=" * 60)
+
+unwrap_result = unwrapper.quality_guided_unwrap(
+    ifg_result.wrapped_phase,
+    ifg_result.coherence
+)
+residues = unwrapper.detect_residues(ifg_result.wrapped_phase)
+
+print(f" 残差点总数: {unwrap_result.num_residues}")
+print(f" 解缠相位范围: [{np.min(unwrap_result.unwrapped_phase):.2f}, {np.max(unwrap_result.unwrapped_phase):.2f}] rad")
 
 print("\n" + "=" * 60)
 print(" 数据处理完成，启动可视化大屏...")
@@ -402,6 +418,165 @@ def create_cross_correlation_figure(cross_corr):
     return fig
 
 
+def create_residue_figure(residues, title='残差点分布'):
+    res_ds = downsample_for_plot(residues, max_size=400)
+
+    pos_y, pos_x = np.where(res_ds == 1)
+    neg_y, neg_x = np.where(res_ds == -1)
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Heatmap(
+        z=np.zeros_like(res_ds, dtype=float),
+        colorscale='Greys',
+        showscale=False,
+        opacity=0.3
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=pos_x,
+        y=pos_y,
+        mode='markers',
+        marker=dict(color='red', size=3, symbol='circle'),
+        name='正残差 (+)',
+        showlegend=True
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=neg_x,
+        y=neg_y,
+        mode='markers',
+        marker=dict(color='blue', size=3, symbol='circle'),
+        name='负残差 (-)',
+        showlegend=True
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text=f'<b>{title}</b><br><span style="font-size:10px;color:#888">正: {len(pos_x)} | 负: {len(neg_x)} | 总计: {len(pos_x)+len(neg_x)}</span>',
+            font=dict(color='white', size=14),
+            x=0.5
+        ),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        yaxis=dict(showticklabels=False, showgrid=False, zeroline=False, scaleanchor='x', scaleratio=1, autorange='reversed'),
+        legend=dict(
+            font=dict(color='white', size=10),
+            bgcolor='rgba(0,0,0,0.5)',
+            x=0.02,
+            y=0.98
+        ),
+        margin=dict(l=10, r=10, t=60, b=10),
+        height=280
+    )
+
+    return fig
+
+
+def create_unwrapped_phase_figure(unwrapped_phase, coherence, title='解缠相位图', threshold=0.3):
+    phase_ds = downsample_for_plot(unwrapped_phase, max_size=400)
+    coh_ds = downsample_for_plot(coherence, max_size=400)
+
+    phase_masked = phase_ds.copy()
+    phase_masked[coh_ds < threshold] = np.nan
+
+    fig = go.Figure(data=go.Heatmap(
+        z=phase_masked,
+        colorscale='Viridis',
+        showscale=True,
+        colorbar=dict(
+            title='相位 (rad)',
+            thickness=15,
+            len=0.7,
+            title_font=dict(color='white'),
+            tickfont=dict(color='white')
+        )
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text=title,
+            font=dict(color='white', size=14),
+            x=0.5
+        ),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        yaxis=dict(showticklabels=False, showgrid=False, zeroline=False, scaleanchor='x', scaleratio=1),
+        margin=dict(l=10, r=10, t=40, b=10),
+        height=280
+    )
+
+    return fig
+
+
+def create_branch_cut_figure(branch_cuts, coherence=None, title='枝切线分布'):
+    bc_ds = downsample_for_plot(branch_cuts.astype(float), max_size=400)
+
+    fig = go.Figure()
+
+    if coherence is not None:
+        coh_ds = downsample_for_plot(coherence, max_size=400)
+        fig.add_trace(go.Heatmap(
+            z=coh_ds,
+            colorscale='Gray',
+            showscale=False,
+            opacity=0.3
+        ))
+
+    fig.add_trace(go.Heatmap(
+        z=bc_ds,
+        colorscale=[[0, 'rgba(255,0,0,0)'], [1, 'rgba(255,50,50,0.9)']],
+        showscale=False
+    ))
+
+    num_bc = int(np.sum(branch_cuts))
+
+    fig.update_layout(
+        title=dict(
+            text=f'<b>{title}</b><br><span style="font-size:10px;color:#888">枝切线长度: {num_bc} 像素</span>',
+            font=dict(color='white', size=14),
+            x=0.5
+        ),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        yaxis=dict(showticklabels=False, showgrid=False, zeroline=False, scaleanchor='x', scaleratio=1),
+        margin=dict(l=10, r=10, t=60, b=10),
+        height=280
+    )
+
+    return fig
+
+
+def create_unwrap_quality_figure(unwrap_mask, title='解缠有效区域'):
+    mask_ds = downsample_for_plot(unwrap_mask.astype(float), max_size=400)
+    valid_ratio = np.sum(unwrap_mask) / unwrap_mask.size
+
+    fig = go.Figure(data=go.Heatmap(
+        z=mask_ds,
+        colorscale=[[0, 'rgba(50,50,80,0.8)'], [1, 'rgba(0,255,150,0.8)']],
+        showscale=False
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text=f'<b>{title}</b><br><span style="font-size:10px;color:#888">解缠率: {valid_ratio*100:.1f}%</span>',
+            font=dict(color='white', size=14),
+            x=0.5
+        ),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        yaxis=dict(showticklabels=False, showgrid=False, zeroline=False, scaleanchor='x', scaleratio=1),
+        margin=dict(l=10, r=10, t=60, b=10),
+        height=280
+    )
+
+    return fig
+
+
 def create_stat_card(title, value, unit, color='cyan', icon='📊'):
     return dbc.Card(
         dbc.CardBody([
@@ -452,6 +627,15 @@ stats_row = dbc.Row([
     dbc.Col(create_stat_card('平均相干系数', f'{ifg_result.mean_coherence:.3f}', 'γ', '#ff8800', '📐'), width=2),
     dbc.Col(create_stat_card('平均漂移速率', f'{drift_analysis["mean_drift"]:.2f}', 'm/月', '#ff4444', '🧊'), width=2),
     dbc.Col(create_stat_card('有效像素比', f'{ifg_result.valid_pixel_ratio*100:.1f}', '%', '#aa44ff', '✅'), width=2),
+], className='mb-2 g-2')
+
+unwrap_stats_row = dbc.Row([
+    dbc.Col(create_stat_card('残差点总数', f'{unwrap_result.num_residues}', '个', '#ff4444', '⚡'), width=2),
+    dbc.Col(create_stat_card('解缠相位跨度', f'{np.ptp(unwrap_result.unwrapped_phase):.1f}', 'rad', '#00ffff', '📏'), width=2),
+    dbc.Col(create_stat_card('相位周期数', f'{np.ptp(unwrap_result.unwrapped_phase)/(2*np.pi):.1f}', '个 2π', '#00ff88', '🔄'), width=2),
+    dbc.Col(create_stat_card('解缠有效率', f'{np.sum(unwrap_result.unwrap_mask)/unwrap_result.unwrap_mask.size*100:.1f}', '%', '#ffff00', '🟢'), width=2),
+    dbc.Col(create_stat_card('解缠算法', unwrap_result.algorithm, '', '#ff88ff', '🧮'), width=2),
+    dbc.Col(create_stat_card('枝切线长度', f'{unwrap_result.num_branch_cuts}', '像素', '#ff6644', '✂️'), width=2),
 ], className='mb-3 g-2')
 
 
@@ -480,6 +664,28 @@ main_content = dbc.Row([
                         ifg_result.coherence
                     ),
                     config={'displayModeBar': True, 'responsive': True}
+                )
+            ])
+        ], className='bg-dark border-secondary mb-3', style={'borderRadius': '8px'}),
+
+        dbc.Card([
+            dbc.CardBody([
+                html.H6('🧩 相位解缠分析', className='text-cyan mb-3', style={'color': '#00ffff'}),
+                dbc.Tabs([
+                    dbc.Tab(label='解缠相位', tab_id='unwrapped'),
+                    dbc.Tab(label='残差点分布', tab_id='residues'),
+                    dbc.Tab(label='枝切线', tab_id='branchcuts'),
+                    dbc.Tab(label='解缠质量', tab_id='unwrapquality'),
+                ], id='unwrap-tabs', active_tab='unwrapped'),
+                dcc.Graph(
+                    id='unwrap-graph',
+                    figure=create_unwrapped_phase_figure(
+                        unwrap_result.unwrapped_phase,
+                        ifg_result.coherence,
+                        '解缠相位图',
+                        0.3
+                    ),
+                    config={'displayModeBar': False, 'responsive': True}
                 )
             ])
         ], className='bg-dark border-secondary', style={'borderRadius': '8px'})
@@ -603,6 +809,36 @@ control_panel = dbc.Card([
             ], width=4),
         ]),
         html.Hr(style={'borderColor': 'rgba(255,255,255,0.1)', 'margin': '15px 0'}),
+        html.H6('🧩 相位解缠算法', className='text-light small mb-2', style={'color': '#ff88ff'}),
+        dbc.Row([
+            dbc.Col([
+                dcc.Dropdown(
+                    id='unwrap-algo-dropdown',
+                    options=[
+                        {'label': '质量引导法', 'value': 'quality'},
+                        {'label': 'Goldstein 枝切法', 'value': 'branch_cut'},
+                        {'label': '最小费用网络流', 'value': 'network_flow'},
+                    ],
+                    value='quality',
+                    className='mb-2',
+                    style={'fontSize': '12px', 'backgroundColor': '#1a1a2e'},
+                    searchable=False
+                ),
+            ], width=12),
+        ]),
+        dbc.Row([
+            dbc.Col([
+                dbc.Button(
+                    '🔬 执行相位解缠',
+                    id='unwrap-btn',
+                    color='warning',
+                    size='sm',
+                    className='w-100',
+                    outline=True
+                ),
+            ], width=12),
+        ]),
+        html.Hr(style={'borderColor': 'rgba(255,255,255,0.1)', 'margin': '15px 0'}),
         dbc.Row([
             dbc.Col([
                 dbc.Button(
@@ -681,6 +917,7 @@ sidebar = html.Div([
 app.layout = dbc.Container([
     header,
     stats_row,
+    unwrap_stats_row,
     dbc.Row([
         dbc.Col(main_content, width=10),
         dbc.Col(sidebar, width=2),
@@ -725,6 +962,64 @@ def update_analysis_tab(active_tab):
         )
     else:
         return create_cross_correlation_figure(coreg_result.cross_correlation)
+
+
+@app.callback(
+    Output('unwrap-graph', 'figure'),
+    Input('unwrap-tabs', 'active_tab')
+)
+def update_unwrap_tab(active_tab):
+    global unwrap_result, residues, ifg_result
+    if active_tab == 'unwrapped':
+        return create_unwrapped_phase_figure(
+            unwrap_result.unwrapped_phase,
+            ifg_result.coherence,
+            '解缠相位图',
+            unwrapper.quality_threshold
+        )
+    elif active_tab == 'residues':
+        return create_residue_figure(residues, '残差点分布')
+    elif active_tab == 'branchcuts':
+        bc = unwrap_result.branch_cuts
+        if bc is None:
+            bc = np.zeros_like(residues, dtype=bool)
+        return create_branch_cut_figure(bc, ifg_result.coherence, '枝切线分布')
+    else:
+        mask = unwrap_result.unwrap_mask
+        if mask is None:
+            mask = np.ones_like(ifg_result.wrapped_phase, dtype=bool)
+        return create_unwrap_quality_figure(mask, '解缠有效区域')
+
+
+@app.callback(
+    Output('hidden-storage', 'children'),
+    Input('unwrap-btn', 'n_clicks'),
+    State('unwrap-algo-dropdown', 'value'),
+    prevent_initial_call=True
+)
+def run_phase_unwrap(n_clicks, algorithm):
+    global unwrap_result, current_unwrap_algorithm
+    print(f"\n=== 用户触发相位解缠: {algorithm} ===")
+
+    if algorithm == 'quality':
+        unwrap_result = unwrapper.quality_guided_unwrap(
+            ifg_result.wrapped_phase,
+            ifg_result.coherence
+        )
+    elif algorithm == 'branch_cut':
+        unwrap_result = unwrapper.branch_cut_unwrap(
+            ifg_result.wrapped_phase,
+            ifg_result.coherence
+        )
+    elif algorithm == 'network_flow':
+        unwrap_result = unwrapper.network_flow_unwrap(
+            ifg_result.wrapped_phase,
+            ifg_result.coherence
+        )
+
+    current_unwrap_algorithm = algorithm
+    print(f"=== 解缠完成: {unwrap_result.algorithm} ===\n")
+    return str(n_clicks)
 
 
 if __name__ == '__main__':
