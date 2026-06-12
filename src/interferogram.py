@@ -2,7 +2,7 @@ import numpy as np
 from scipy.ndimage import uniform_filter, gaussian_filter, median_filter
 import time
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 from scipy.signal import convolve2d
 
 
@@ -15,6 +15,7 @@ class InterferogramResult:
     amplitude_slave: np.ndarray
     mean_coherence: float
     valid_pixel_ratio: float
+    aps_phase: Optional[np.ndarray] = None
 
 
 class Interferogram:
@@ -68,7 +69,8 @@ class Interferogram:
             amplitude_master=amp_master,
             amplitude_slave=amp_slave,
             mean_coherence=mean_coh,
-            valid_pixel_ratio=valid_ratio
+            valid_pixel_ratio=valid_ratio,
+            aps_phase=None
         )
 
     def _compute_coherence(
@@ -247,3 +249,27 @@ class Interferogram:
                 cleaned[region] = nearby_coh
 
         return cleaned
+
+    def inject_atmospheric_phase(
+        self,
+        ifg_result,
+        aps_phase: np.ndarray
+    ):
+        """
+        向已有的干涉图结果注入合成大气相位屏幕(APS)
+        物理上相当于电磁波穿过对流层时产生的相位延迟
+        """
+        H, W = ifg_result.wrapped_phase.shape
+        assert aps_phase.shape == (H, W)
+
+        interferogram_complex = ifg_result.interferogram
+        phase_rotation = np.exp(1j * aps_phase)
+        interferogram_with_aps = interferogram_complex * phase_rotation
+
+        wrapped_phase_aps = np.angle(interferogram_with_aps)
+
+        ifg_result.wrapped_phase = wrapped_phase_aps
+        ifg_result.interferogram = interferogram_with_aps
+        ifg_result.aps_phase = aps_phase
+
+        return ifg_result

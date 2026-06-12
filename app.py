@@ -11,6 +11,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.slc_processor import SLCProcessor
 from src.interferogram import Interferogram
 from src.phase_unwrap import PhaseUnwrapper
+from src.geophysical_quant import (
+    generate_dem,
+    simulate_aps,
+    correct_aps_elevation_correlated,
+    phase_to_los_displacement,
+    los_to_3d_vectors,
+    downsample_vectors,
+    compute_geophysical_summary
+)
 
 
 processor = SLCProcessor(width=1024, height=1024)
@@ -27,7 +36,7 @@ slave_slc = processor.generate_slave_from_master(
     master_slc,
     offset_x=23.4,
     offset_y=-12.7,
-    deformation_phase=3.0,
+    deformation_phase=15.0,
     seed=123
 )
 
@@ -64,6 +73,22 @@ print(f" 平均漂移速率: {drift_analysis['mean_drift']:.2f} m/月")
 print(f" 最大漂移速率: {drift_analysis['max_drift']:.2f} m/月")
 
 print("\n" + "=" * 60)
+print(" 生成南极冰川数字高程模型 (DEM)...")
+print("=" * 60)
+
+dem = generate_dem(master_slc.shape, center_lat=-75.0, seed=42)
+print(f" 地形高程范围: [{dem['elev'].min():.1f}, {dem['elev'].max():.1f}] m")
+print(f" 平均高程: {dem['elev'].mean():.1f} m")
+
+print("\n" + "=" * 60)
+print(" 模拟极地对流层大气相位屏幕 (APS)...")
+print("=" * 60)
+
+aps_true = simulate_aps(dem, strength=2.5, seed=123)
+ifg_result = interferogram_calc.inject_atmospheric_phase(ifg_result, aps_true)
+print(f" 注入 APS 强度 RMS: {np.sqrt(np.mean(aps_true**2)):.3f} rad")
+
+print("\n" + "=" * 60)
 print(" 相位解缠 (初始: 质量引导法)...")
 print("=" * 60)
 
@@ -75,6 +100,54 @@ residues = unwrapper.detect_residues(ifg_result.wrapped_phase)
 
 print(f" 残差点总数: {unwrap_result.num_residues}")
 print(f" 解缠相位范围: [{np.min(unwrap_result.unwrapped_phase):.2f}, {np.max(unwrap_result.unwrapped_phase):.2f}] rad")
+
+print("\n" + "=" * 60)
+print(" 基于高程相关性的大气校正滤波...")
+print("=" * 60)
+
+DEFAULT_WAVELENGTH_M = 0.056
+DEFAULT_INCIDENCE_DEG = 34.0
+DEFAULT_HEADING_DEG = -13.0
+DEFAULT_PIXEL_SIZE = 20.0
+
+aps_result = correct_aps_elevation_correlated(
+    unwrap_result.unwrapped_phase,
+    dem['elev'],
+    coherence=ifg_result.coherence,
+    mask=(ifg_result.coherence > 0.3) & unwrap_result.unwrap_mask,
+    poly_order=3
+)
+corrected_phase = aps_result['corrected']
+print(f" APS 估计 RMS: {np.sqrt(np.mean(aps_result['aps_estimated']**2)):.3f} rad")
+print(f" 校正后相位 RMS: {np.sqrt(np.mean(corrected_phase**2)):.3f} rad")
+
+print("\n" + "=" * 60)
+print(" 相位 → LOS位移 → 三维矢量分解...")
+print("=" * 60)
+
+d_los = phase_to_los_displacement(corrected_phase, wavelength=DEFAULT_WAVELENGTH_M)
+d_los[ifg_result.coherence < 0.3] = np.nan
+
+vectors_3d = los_to_3d_vectors(
+    d_los,
+    incidence_angle_deg=DEFAULT_INCIDENCE_DEG,
+    heading_angle_deg=DEFAULT_HEADING_DEG,
+    pixel_size=DEFAULT_PIXEL_SIZE
+)
+
+vec_arrows = downsample_vectors(
+    vectors_3d['vx'], vectors_3d['vy'], vectors_3d['vz'],
+    dem['elev'], factor=16, threshold_ratio=0.15
+)
+print(f" 生成 3D 矢量箭头数量: {len(vec_arrows['X'])}")
+
+geo_summary = compute_geophysical_summary(
+    d_los, vectors_3d, aps_result, ifg_result.coherence,
+    pixel_size=DEFAULT_PIXEL_SIZE, days_between=30
+)
+print(f" 年均冰川流速: {geo_summary['yearly_speed_m']:.2f} m/yr")
+print(f" 最大沉降量: {geo_summary['max_subsidence_m']:.3f} m")
+print(f" 净体积变化: {geo_summary['net_volume_change_km3']:.4f} km³")
 
 print("\n" + "=" * 60)
 print(" 数据处理完成，启动可视化大屏...")
@@ -577,6 +650,197 @@ def create_unwrap_quality_figure(unwrap_mask, title='解缠有效区域'):
     return fig
 
 
+def create_aps_correction_figure(uncorrected, corrected, aps_estimated, title='大气校正前后对比'):
+    unc_ds = downsample_for_plot(uncorrected, max_size=300)
+    cor_ds = downsample_for_plot(corrected, max_size=300)
+    aps_ds = downsample_for_plot(aps_estimated, max_size=300)
+
+    vmax = max(np.nanmax(np.abs(unc_ds)), np.nanmax(np.abs(cor_ds)))
+
+    fig = make_subplots(
+        rows=1, cols=3,
+        subplot_titles=('校正前相位', '估计APS', '校正后相位'),
+        horizontal_spacing=0.06
+    )
+
+    fig.add_trace(go.Heatmap(
+        z=unc_ds, colorscale='RdBu_r', zmin=-vmax, zmax=vmax, showscale=False
+    ), row=1, col=1)
+    fig.add_trace(go.Heatmap(
+        z=aps_ds, colorscale='RdBu_r', showscale=False
+    ), row=1, col=2)
+    fig.add_trace(go.Heatmap(
+        z=cor_ds, colorscale='RdBu_r', zmin=-vmax, zmax=vmax,
+        showscale=True,
+        colorbar=dict(
+            title='rad', thickness=12, len=0.7,
+            title_font=dict(color='white'),
+            tickfont=dict(color='white')
+        )
+    ), row=1, col=3)
+
+    fig.update_layout(
+        title=dict(text=f'<b>{title}</b>', font=dict(color='white', size=14), x=0.5),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        height=280,
+        margin=dict(l=10, r=30, t=60, b=10)
+    )
+    for i in range(1, 4):
+        fig.update_xaxes(showticklabels=False, showgrid=False, zeroline=False, row=1, col=i)
+        fig.update_yaxes(showticklabels=False, showgrid=False, zeroline=False, scaleanchor='x', scaleratio=1, row=1, col=i)
+        fig.update_annotations(font=dict(color='white', size=11))
+
+    return fig
+
+
+def create_vertical_displacement_figure(vz, coherence, title='垂直沉降图 (向下为负)'):
+    vz_ds = downsample_for_plot(vz, max_size=400)
+    coh_ds = downsample_for_plot(coherence, max_size=400)
+    vz_ds[coh_ds < 0.3] = np.nan
+
+    vmax = np.nanpercentile(np.abs(vz_ds), 98)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=vz_ds,
+        colorscale='RdBu_r',
+        zmin=-vmax, zmax=vmax,
+        showscale=True,
+        colorbar=dict(
+            title='位移 (m)', thickness=15, len=0.7,
+            title_font=dict(color='white'), tickfont=dict(color='white')
+        )
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text=f'<b>{title}</b><br><span style="font-size:10px;color:#888">蓝:沉降 | 红:抬升</span>',
+            font=dict(color='white', size=14), x=0.5
+        ),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        yaxis=dict(showticklabels=False, showgrid=False, zeroline=False, scaleanchor='x', scaleratio=1),
+        margin=dict(l=10, r=10, t=60, b=10),
+        height=280
+    )
+    return fig
+
+
+def create_3d_terrain_vectors(elev, vx, vy, vz, coherence, arrows_data, title='3D 冰川地形 + 位移矢量场'):
+    elev_ds = downsample_for_plot(elev, max_size=120)
+    H, W = elev_ds.shape
+
+    coh_ds = downsample_for_plot(coherence, max_size=120)
+    elev_masked = elev_ds.copy()
+    elev_masked[coh_ds < 0.15] = np.nan
+
+    x = np.arange(W)
+    y = np.arange(H)
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Surface(
+        z=elev_masked,
+        x=x,
+        y=y,
+        colorscale='Gray',
+        cmin=np.nanpercentile(elev_ds, 5),
+        cmax=np.nanpercentile(elev_ds, 95),
+        showscale=True,
+        opacity=0.85,
+        colorbar=dict(
+            title='高程 (m)', thickness=15, len=0.6,
+            title_font=dict(color='white'), tickfont=dict(color='white'),
+            x=0.02
+        ),
+        contours=dict(
+            z=dict(show=True, usecolormap=True, project=dict(z=True), size=200)
+        ),
+        lighting=dict(ambient=0.6, diffuse=0.8, specular=0.2),
+        lightposition=dict(x=100, y=100, z=1000)
+    ))
+
+    H_full, W_full = elev.shape
+    sx = W / W_full
+    sy = H / H_full
+    sz = 1.0
+
+    ax = arrows_data['X'] * sx
+    ay = arrows_data['Y'] * sy
+    az = arrows_data['Z'] * sz
+
+    ds_factor = max(H_full, W_full) / max(W, H)
+    scale_horiz = sx * 60.0 / (np.nanmax(np.sqrt(vx ** 2 + vy ** 2)) + 1e-6)
+    scale_vert = sz * 500.0 / (np.nanmax(np.abs(vz)) + 1e-6)
+
+    au = arrows_data['U'] * scale_horiz
+    av = arrows_data['V'] * scale_horiz
+    aw = arrows_data['W'] * scale_vert
+    mag = arrows_data['magnitude']
+
+    cone_sizes = 1.0 + 4.0 * (mag - mag.min()) / (mag.max() - mag.min() + 1e-9)
+
+    fig.add_trace(go.Cone(
+        x=ax + au,
+        y=ay + av,
+        z=az + aw,
+        u=au,
+        v=av,
+        w=aw,
+        colorscale=[[0, '#ff2222'], [1, '#ff6644']],
+        showscale=True,
+        colorbar=dict(
+            title='位移 (m)', thickness=15, len=0.6,
+            title_font=dict(color='white'), tickfont=dict(color='white'),
+            x=0.98
+        ),
+        sizemode='absolute',
+        sizeref=float(np.mean(cone_sizes)),
+        opacity=0.95,
+        anchor='tip',
+        name='位移矢量'
+    ))
+
+    mid_idx = np.argsort(mag)[-min(40, len(mag)):]
+    line_x, line_y, line_z = [], [], []
+    for i in mid_idx:
+        line_x.extend([ax[i], ax[i] + au[i], None])
+        line_y.extend([ay[i], ay[i] + av[i], None])
+        line_z.extend([az[i], az[i] + aw[i], None])
+
+    fig.add_trace(go.Scatter3d(
+        x=line_x, y=line_y, z=line_z,
+        mode='lines',
+        line=dict(color='#ff0000', width=3),
+        showlegend=False,
+        opacity=0.8
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text=f'<b>{title}</b><br><span style="font-size:10px;color:#aaa">红色箭头:冰川三维流动方向 | 锥头大小:位移强度</span>',
+            font=dict(color='cyan', size=15), x=0.5
+        ),
+        scene=dict(
+            xaxis_title='方位向',
+            yaxis_title='距离向',
+            zaxis_title='高程 (m)',
+            xaxis=dict(showbackground=True, backgroundcolor='rgba(0,20,40,0.5)', color='white', showticklabels=False),
+            yaxis=dict(showbackground=True, backgroundcolor='rgba(0,20,40,0.5)', color='white', showticklabels=False),
+            zaxis=dict(showbackground=True, backgroundcolor='rgba(0,20,40,0.8)', color='white'),
+            aspectmode='manual',
+            aspectratio=dict(x=1, y=1, z=0.6),
+            camera=dict(eye=dict(x=1.4, y=1.6, z=0.9))
+        ),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=10, r=10, t=60, b=10),
+        height=620
+    )
+    return fig
+
+
 def create_stat_card(title, value, unit, color='cyan', icon='📊'):
     return dbc.Card(
         dbc.CardBody([
@@ -636,6 +900,15 @@ unwrap_stats_row = dbc.Row([
     dbc.Col(create_stat_card('解缠有效率', f'{np.sum(unwrap_result.unwrap_mask)/unwrap_result.unwrap_mask.size*100:.1f}', '%', '#ffff00', '🟢'), width=2),
     dbc.Col(create_stat_card('解缠算法', unwrap_result.algorithm, '', '#ff88ff', '🧮'), width=2),
     dbc.Col(create_stat_card('枝切线长度', f'{unwrap_result.num_branch_cuts}', '像素', '#ff6644', '✂️'), width=2),
+], className='mb-2 g-2')
+
+geo_stats_row = dbc.Row([
+    dbc.Col(create_stat_card('APS RMS', f'{geo_summary["aps_rms_rad"]:.3f}', 'rad', '#ff44aa', '🌫️'), width=2),
+    dbc.Col(create_stat_card('年均流速', f'{geo_summary["yearly_speed_m"]:.2f}', 'm/yr', '#00ffff', '🧊'), width=2),
+    dbc.Col(create_stat_card('日流速', f'{geo_summary["daily_speed_cm"]:.2f}', 'cm/天', '#00ff88', '📏'), width=2),
+    dbc.Col(create_stat_card('最大沉降', f'{geo_summary["max_subsidence_m"]:.3f}', 'm', '#4488ff', '⬇️'), width=2),
+    dbc.Col(create_stat_card('最大抬升', f'{geo_summary["max_uplift_m"]:.3f}', 'm', '#ffaa00', '⬆️'), width=2),
+    dbc.Col(create_stat_card('净体积变化', f'{geo_summary["net_volume_change_km3"]:.4f}', 'km³', '#ff6644', '📦'), width=2),
 ], className='mb-3 g-2')
 
 
@@ -644,10 +917,12 @@ main_content = dbc.Row([
         dbc.Card([
             dbc.CardBody([
                 dcc.Graph(
-                    id='3d-deformation-graph',
-                    figure=create_3d_deformation_figure(
-                        ifg_result.wrapped_phase,
-                        ifg_result.coherence
+                    id='3d-terrain-vectors-graph',
+                    figure=create_3d_terrain_vectors(
+                        dem['elev'],
+                        vectors_3d['vx'], vectors_3d['vy'], vectors_3d['vz'],
+                        ifg_result.coherence,
+                        vec_arrows
                     ),
                     config={'displayModeBar': True, 'responsive': True}
                 )
@@ -656,14 +931,21 @@ main_content = dbc.Row([
 
         dbc.Card([
             dbc.CardBody([
+                html.H6('🌫️ 大气校正 & 物理解译', className='mb-3', style={'color': '#ff88ff'}),
+                dbc.Tabs([
+                    dbc.Tab(label='大气校正对比', tab_id='aps_correction'),
+                    dbc.Tab(label='垂直沉降场', tab_id='vertical_disp'),
+                    dbc.Tab(label='LOS位移场', tab_id='los_disp'),
+                    dbc.Tab(label='水平流速场', tab_id='horizontal_speed'),
+                ], id='geo-tabs', active_tab='aps_correction'),
                 dcc.Graph(
-                    id='drift-vector-graph',
-                    figure=create_drift_vector_figure(
-                        drift_analysis['drift_magnitude'],
-                        drift_analysis['drift_direction'],
-                        ifg_result.coherence
+                    id='geo-graph',
+                    figure=create_aps_correction_figure(
+                        unwrap_result.unwrapped_phase,
+                        aps_result['corrected'],
+                        aps_result['aps_estimated']
                     ),
-                    config={'displayModeBar': True, 'responsive': True}
+                    config={'displayModeBar': False, 'responsive': True}
                 )
             ])
         ], className='bg-dark border-secondary mb-3', style={'borderRadius': '8px'}),
@@ -918,6 +1200,7 @@ app.layout = dbc.Container([
     header,
     stats_row,
     unwrap_stats_row,
+    geo_stats_row,
     dbc.Row([
         dbc.Col(main_content, width=10),
         dbc.Col(sidebar, width=2),
@@ -992,6 +1275,96 @@ def update_unwrap_tab(active_tab):
 
 
 @app.callback(
+    Output('geo-graph', 'figure'),
+    Input('geo-tabs', 'active_tab')
+)
+def update_geo_tab(active_tab):
+    global unwrap_result, aps_result, d_los, vectors_3d, ifg_result
+    if active_tab == 'aps_correction':
+        return create_aps_correction_figure(
+            unwrap_result.unwrapped_phase,
+            aps_result['corrected'],
+            aps_result['aps_estimated'],
+            '基于高程相关性的大气相位屏幕(APS)校正'
+        )
+    elif active_tab == 'vertical_disp':
+        return create_vertical_displacement_figure(
+            vectors_3d['vz'],
+            ifg_result.coherence,
+            '冰川垂直沉降/抬升场 (负=沉降, 正=抬升)'
+        )
+    elif active_tab == 'los_disp':
+        fig = go.Figure()
+        los_ds = downsample_for_plot(d_los, max_size=400)
+        coh_ds = downsample_for_plot(ifg_result.coherence, max_size=400)
+        los_ds[coh_ds < 0.3] = np.nan
+        vmax = np.nanpercentile(np.abs(los_ds), 98)
+        fig.add_trace(go.Heatmap(
+            z=los_ds, colorscale='RdBu_r', zmin=-vmax, zmax=vmax,
+            colorbar=dict(title='LOS (m)', thickness=15, len=0.7,
+                          title_font=dict(color='white'), tickfont=dict(color='white'))
+        ))
+        fig.update_layout(
+            title=dict(text='<b>雷达视线向(LOS)位移</b><br><span style="font-size:10px;color:#888">正=朝向卫星 | 负=远离卫星</span>',
+                       font=dict(color='white', size=14), x=0.5),
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+            xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+            yaxis=dict(showticklabels=False, showgrid=False, zeroline=False, scaleanchor='x', scaleratio=1),
+            margin=dict(l=10, r=10, t=60, b=10), height=280
+        )
+        return fig
+    else:
+        fig = go.Figure()
+        spd_ds = downsample_for_plot(vectors_3d['speed'], max_size=400)
+        coh_ds = downsample_for_plot(ifg_result.coherence, max_size=400)
+        spd_ds[coh_ds < 0.3] = np.nan
+        vmax = np.nanpercentile(spd_ds, 95)
+        fig.add_trace(go.Heatmap(
+            z=spd_ds, colorscale='Jet', zmin=0, zmax=vmax,
+            colorbar=dict(title='速度 (m)', thickness=15, len=0.7,
+                          title_font=dict(color='white'), tickfont=dict(color='white'))
+        ))
+        fig.update_layout(
+            title=dict(text='<b>冰川水平流速场</b><br><span style="font-size:10px;color:#888">30天累计水平位移</span>',
+                       font=dict(color='white', size=14), x=0.5),
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+            xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+            yaxis=dict(showticklabels=False, showgrid=False, zeroline=False, scaleanchor='x', scaleratio=1),
+            margin=dict(l=10, r=10, t=60, b=10), height=280
+        )
+        return fig
+
+
+def _recompute_geophysics_after_unwrap():
+    """相位解缠后，重新进行大气校正、LOS分解和3D矢量计算"""
+    global aps_result, corrected_phase, d_los, vectors_3d, vec_arrows, geo_summary
+    aps_result = correct_aps_elevation_correlated(
+        unwrap_result.unwrapped_phase,
+        dem['elev'],
+        coherence=ifg_result.coherence,
+        mask=(ifg_result.coherence > 0.3) & unwrap_result.unwrap_mask,
+        poly_order=3
+    )
+    corrected_phase = aps_result['corrected']
+    d_los = phase_to_los_displacement(corrected_phase, wavelength=DEFAULT_WAVELENGTH_M)
+    d_los[ifg_result.coherence < 0.3] = np.nan
+    vectors_3d = los_to_3d_vectors(
+        d_los,
+        incidence_angle_deg=DEFAULT_INCIDENCE_DEG,
+        heading_angle_deg=DEFAULT_HEADING_DEG,
+        pixel_size=DEFAULT_PIXEL_SIZE
+    )
+    vec_arrows = downsample_vectors(
+        vectors_3d['vx'], vectors_3d['vy'], vectors_3d['vz'],
+        dem['elev'], factor=16, threshold_ratio=0.15
+    )
+    geo_summary = compute_geophysical_summary(
+        d_los, vectors_3d, aps_result, ifg_result.coherence,
+        pixel_size=DEFAULT_PIXEL_SIZE, days_between=30
+    )
+
+
+@app.callback(
     Output('hidden-storage', 'children'),
     Input('unwrap-btn', 'n_clicks'),
     State('unwrap-algo-dropdown', 'value'),
@@ -1018,7 +1391,10 @@ def run_phase_unwrap(n_clicks, algorithm):
         )
 
     current_unwrap_algorithm = algorithm
-    print(f"=== 解缠完成: {unwrap_result.algorithm} ===\n")
+    print(f"=== 解缠完成: {unwrap_result.algorithm} ===")
+    print("=== 重新计算大气校正与3D矢量分解 ===")
+    _recompute_geophysics_after_unwrap()
+    print(f"=== 完成 | 年均流速 {geo_summary['yearly_speed_m']:.2f} m/yr | 最大沉降 {geo_summary['max_subsidence_m']:.3f} m ===\n")
     return str(n_clicks)
 
 
